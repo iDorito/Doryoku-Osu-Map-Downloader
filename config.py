@@ -1,6 +1,36 @@
-import sys
 import os
+from pathlib import Path
 
-# PATHS
-ABS_PATH = os.path.dirname(os.path.abspath(__file__))
-DB_JSON_PATH = os.path.join(ABS_PATH, 'db.json')
+HOME_PATH = Path.home()
+
+# Plataforma
+IS_WINDOWS = os.name == 'nt'
+IS_LINUX  = os.name == 'linux'
+IS_MAC = os.name == "darwin"
+IS_ANDROID = os.name == "android"
+
+if IS_WINDOWS:
+    APPDATA = Path(os.environ["APPDATA"])
+    DOWNLOAD_PATH = APPDATA / "domd" / "downloads"
+    DB_JSON = APPDATA / "domd"                  # Solo la carpeta
+    LASER_FILES_PATH = APPDATA / "osu" / "files"
+elif IS_MAC:
+    # macOS paths
+    DOWNLOAD_PATH = HOME_PATH / "Downloads"
+    DB_JSON = HOME_PATH / "Library" / "Application Support" / "domd" / "db.json"
+    LASER_FILES_PATH = HOME_PATH / "Library" / "Application Support" / "osu" / "files"
+elif IS_LINUX:
+    # Linux paths
+    DOWNLOAD_PATH = HOME_PATH / "Downloads"
+    DB_JSON = HOME_PATH / ".local" / "share" / "domd" / "db.json"
+    LASER_FILES_PATH = HOME_PATH / ".local" / "share" / "osu" / "files"
+elif IS_ANDROID:
+    # Android (termux / Android filesystem)
+    DOWNLOAD_PATH = HOME_PATH / "Downloads"
+    DB_JSON = HOME_PATH / ".domd" / "db.json"
+    LASER_FILES_PATH = Path("/storage/emulated/0/Android/data/sh.ppy.osulazer/files")
+else:
+    # Fallback
+    DOWNLOAD_PATH = HOME_PATH / "Downloads"
+    DB_JSON = HOME_PATH / ".local" / "share" / "domd" / "db.json"
+    LASER_FILES_PATH = None

@@ -1,37 +1,39 @@
-#!/usr/bin/env python # 
+#!/usr/bin/env python
 """\
 Helper module to find osu beatmapset ids inside folders for lazer.
-
-By: Ricardo Faria
-Osu User: Doryoku
-
-Usage: run the script in cmd/terminal: python get_existing_ids_lazer.py
 """
+
 import os
 import json
 import config
-import sys
+from pathlib import Path
 
-# --- FILES PATHS---
-if sys.platform.startswith("win"):
-    LASER_FILES_PATH = os.path.join(os.environ.get("APPDATA", ""), "osu", "files")
-elif sys.platform.startswith("darwin"):
-    LASER_FILES_PATH = os.path.expanduser("~/Library/Application Support/osu/files")
-elif sys.platform.startswith("linux"):
-    LASER_FILES_PATH = os.path.expanduser("~/.local/share/osu/files")
-elif sys.platform.startswith("android"):
-    LASER_FILES_PATH = "/storage/emulated/0/Android/data/sh.ppy.osulazer/files"
+# MAIN PATHS - directamente desde config (ya son Path objects)
+LASER_FILES_PATH = config.LASER_FILES_PATH
+DOWNLOAD_PATH = config.DOWNLOAD_PATH
+DB_JSON_DIR = config.DB_JSON          # Esto es la carpeta: .../domd/
+JSON_FILE_PATH = DB_JSON_DIR / "db.json"   # Ruta completa al archivo
+
+# === CREAR CARPETAS SI NO EXISTEN ===
+# Usamos los métodos de pathlib directamente (más seguro y claro)
+
+DOWNLOAD_PATH.mkdir(parents=True, exist_ok=True)
+LASER_FILES_PATH.mkdir(parents=True, exist_ok=True)
+DB_JSON_DIR.mkdir(parents=True, exist_ok=True)   # Crea la carpeta domd
+
+print(f"Carpeta downloads: {DOWNLOAD_PATH}")
+print(f"Carpeta lazer files: {LASER_FILES_PATH}")
+print(f"Carpeta DB: {DB_JSON_DIR}")
+print(f"Archivo JSON será: {JSON_FILE_PATH}")
+
+# === CREAR ARCHIVO JSON SI NO EXISTE ===
+if not JSON_FILE_PATH.exists():
+    print("Creando nuevo db.json vacío...")
+    JSON_FILE_PATH.write_text(json.dumps({"downloaded_maps": []}, indent=4), encoding='utf-8')
 else:
-    LASER_FILES_PATH = ""
+    print("db.json ya existe.")
 
-# JSON FILE
-JSON_FILE = open(config.DB_JSON_PATH)
-
-if not os.path.exists(config.DB_JSON_PATH):
-    with open(config.DB_JSON_PATH, "w") as f:
-        json.dump({}, f)
-
-
+# === TUS FUNCIONES (sin cambios) ===
 def is_osu_file(file_path):
     try:
         with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
@@ -43,16 +45,13 @@ def is_osu_file(file_path):
 def extract_beatmapset_id(file_path):
     try:
         with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-            f.readline()  # Skip the first line, already checked
+            f.readline()  # Skip first line
             for line in f:
                 if line.startswith('BeatmapSetID:'):
-                    parts = line.split(':')
-                    if len(parts) > 1:
-                        try:
-                            return int(parts[1].strip())
-                        except ValueError:
-                            return None
-                    break
+                    try:
+                        return int(line.split(':', 1)[1].strip())
+                    except ValueError:
+                        return None
                 if line.startswith('[HitObjects]'):
                     break
     except Exception:
@@ -60,16 +59,20 @@ def extract_beatmapset_id(file_path):
     return None
 
 def lazer_beatmapsets_ids_scan():
-    print(f"Scanning path: {LASER_FILES_PATH}")
-    print("This can take a while depending on how many maps you have...")
+    print(f"Escaneando: {LASER_FILES_PATH}")
+    print("Esto puede tardar dependiendo de cuántos mapas tengas...")
 
     found_id_sets = set()
     revised_files = 0
     maps_found = 0
 
+    if not LASER_FILES_PATH.exists():
+        print("Error: La carpeta de osu!lazer no existe. ¿Tienes osu!lazer instalado?")
+        return []
+
     for root, dirs, files in os.walk(LASER_FILES_PATH):
         for filename in files:
-            full_path = os.path.join(root, filename)
+            full_path = Path(root) / filename
             revised_files += 1
 
             if not is_osu_file(full_path):
@@ -77,24 +80,28 @@ def lazer_beatmapsets_ids_scan():
 
             maps_found += 1
             beatmapset_id = extract_beatmapset_id(full_path)
-            if beatmapset_id is not None:
+            if beatmapset_id is not None and beatmapset_id != -1:  # -1 es común en mapas locales
                 found_id_sets.add(beatmapset_id)
 
-    print("\n--- RESUME ---")
-    print(f"Scanned files: {revised_files}")
-    print(f"Files detected of .osu extension: {maps_found}")
-    print(f"Unique sets found: {len(found_id_sets)}")
+    print("\n--- RESUMEN ---")
+    print(f"Archivos escaneados: {revised_files}")
+    print(f"Archivos .osu detectados: {maps_found}")
+    print(f"Sets únicos encontrados: {len(found_id_sets)}")
 
-    return list(found_id_sets)
+    return sorted(found_id_sets)
 
-# --- USO ---
+# === EJECUCIÓN PRINCIPAL ===
 if __name__ == "__main__":
-    if os.path.exists(LASER_FILES_PATH):
-        mis_ids = lazer_beatmapsets_ids_scan()
-        print(f"IDs: {mis_ids[:20]} ... (y mas)")
-        
-        # Opcional: Guardarlos en un txt para no escanear siempre
-        with open("db.json", "w") as f:
-            json.dump({"downloaded_maps": mis_ids}, f, indent=4)
-    else:
-        print("Error: Osu!Lazer files folder wasn't found")
+    ids_encontrados = lazer_beatmapsets_ids_scan()
+
+    resultado = {"downloaded_maps": ids_encontrados}
+
+    # Guardar en el JSON
+    with open(JSON_FILE_PATH, "w", encoding="utf-8") as f:
+        json.dump(resultado, f, indent=4)
+
+    print(f"\n¡Listo! IDs guardados en:")
+    print(f"   {JSON_FILE_PATH}")
+    print(f"   Total de sets únicos: {len(ids_encontrados)}")
+    if ids_encontrados:
+        print(f"   Primeros 20: {ids_encontrados[:20]}")
