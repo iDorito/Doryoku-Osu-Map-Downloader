@@ -25,6 +25,7 @@ import PyQt6.QtCore as QtCore
 from PyQt6.QtWidgets import QApplication, QMainWindow, QPushButton, QVBoxLayout, QWidget
 from PyQt6.QtWidgets import QLabel, QComboBox, QTextEdit, QLineEdit, QHBoxLayout, QDateEdit
 from PyQt6.QtWidgets import QFileDialog
+from PyQt6.QtGui import QStandardItemModel, QStandardItem
 from PyQt6.QtCore import QThread, pyqtSignal, QEventLoop
 # ----------------------------------------------------------------------
 import config
@@ -53,7 +54,6 @@ if not os.path.exists(DOWNLOAD_PATH):
 CHIMU="https://api.chimu.moe/v1/download/{set_id}?n=1"
 SAYO_BOT="https://dl.sayobot.cn/beatmaps/download/full/{set_id}"
 NERINYAN="https://api.nerinyan.moe/d/{set_id}"
-
 
 # ----------------------------------------------------------------------
 class OsuLoginWorker(QThread):
@@ -163,12 +163,15 @@ class BeatmatsetIdsWorker(QThread):
         self.dest_list = [] 
         self.current_page = 1
 
+        
+
     def run(self):
         # Set to detect duplicates
         session_ids = set()
         cursor = None
 
         self.log_signal.emit("Starting beatmapset ids worker...")
+        self.log_signal.emit(f"Working with params: {self.call_params}")
 
         while True:
             # Copy params so cursor doesnt repeat
@@ -284,9 +287,6 @@ class StarRatingFilterWidget(QWidget):
         self.layout.addWidget(self.less_than_check_button)
 
         self.setLayout(self.layout)
-
-    def get_layout(self):
-        return self.layout
     
     def on_diff_button_click(self, button_type):
         """
@@ -310,6 +310,124 @@ class StarRatingFilterWidget(QWidget):
             self.higher_than_check_button.setEnabled(True)
             self.equals_check_button.setEnabled(True)
             self.less_than_check_button.setEnabled(False)
+
+class DateFilterWidget(QWidget):
+    def __init__(self):
+        super().__init__()
+
+        self.layout = QHBoxLayout()
+        self.layout.setAlignment(QtCore.Qt.AlignmentFlag.AlignLeft)
+
+        self.date_filter_label = QLabel()
+        self.date_filter_label.setText("Date:")
+        self.date_filter_label.setFixedWidth(40)
+        self.layout.addWidget(self.date_filter_label)
+
+        self.date_filter = QDateEdit()
+        self.date_filter.setDate(QtCore.QDate.currentDate())
+        self.date_filter.setDisplayFormat("dd-MM-yyyy")
+        self.date_filter.setCalendarPopup(True)
+        self.layout.addWidget(self.date_filter)
+
+        self.date_filter_since_button = QPushButton()
+        self.date_filter_since_button.setText(">=")
+        self.date_filter_since_button.setFixedWidth(60)
+        self.date_filter_since_button.setCheckable(True)
+        self.date_filter_since_button.clicked.connect(lambda: self.on_date_filter_button_click(1))
+        self.layout.addWidget(self.date_filter_since_button)
+
+        self.date_filter_until_button = QPushButton()
+        self.date_filter_until_button.setText("<=")
+        self.date_filter_until_button.setFixedWidth(60)
+        self.date_filter_until_button.setCheckable(True)
+        self.date_filter_until_button.clicked.connect(lambda: self.on_date_filter_button_click(2))
+        self.layout.addWidget(self.date_filter_until_button)
+
+        self.setLayout(self.layout)
+
+    def on_date_filter_button_click(self, button_type):
+        """
+        Handles the date filter buttons
+        
+        if one is clicked, the other is unclicked
+        1 = since
+        2 = until
+        """
+        
+        if button_type == 1:
+            self.date_filter_since_button.setEnabled(False)
+            self.date_filter_until_button.setEnabled(True)
+
+            # Re enable check for <= button
+            self.date_filter_until_button.setChecked(False)
+        elif button_type == 2:
+            self.date_filter_since_button.setEnabled(True)
+            self.date_filter_until_button.setEnabled(False)
+
+            # Re enable check for >= button
+            self.date_filter_since_button.setChecked(False)
+
+
+class CheckableComboBox(QComboBox):
+    def __init__(self):
+        super().__init__()
+
+        # Making it editable by the script but not by the user
+        self.setEditable(True)
+        self.lineEdit().setReadOnly(True)
+
+        # Qstardard item boxes for a checkable item
+        self.model = QStandardItemModel(self)
+        self.setModel(self.model)
+
+        # Event for QComboBox view click
+        self.view().pressed.connect(self.handle_item_pressed)
+
+        # First line
+        self.lineEdit().setPlaceholderText("Select Mode")
+
+    def handle_item_pressed(self, index):
+        item = self.model.itemFromIndex(index)
+
+        item.setCheckState(not item.checkState())
+
+        self.update_display_text()
+
+    def update_display_text(self):
+        # Selected items
+        self.selected_items = []
+
+        for row in range(self.model.rowCount()):
+            item = self.model.item(row)
+            if item.checkState() == QtCore.Qt.CheckState.Checked:
+                self.selected_items.append(item.text())
+
+
+    def addItem(self, text, data=None):
+        item = QStandardItem(text)
+        item.setData(data)
+        item.setFlags(QtCore.Qt.ItemFlag.ItemIsEnabled | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
+        item.setCheckState(QtCore.Qt.CheckState.Unchecked)
+        self.model.appendRow(item)
+
+    def get_checked_items(self):
+        """Returns a list with the text of the selected items"""
+        checked_items = []
+        for i in range(self.model.rowCount()):
+            item = self.model.item(i)
+            if item.checkState() == QtCore.Qt.CheckState.Checked:
+                checked_items.append(item.text())
+        return checked_items
+    
+    def get_checked_data(self):
+        """Return an array of the selected items"""
+        checked_data = []
+        for i in range(self.model.rowCount()):
+            item = self.model.item(i)
+            if item.checkState() == QtCore.Qt.CheckState.Checked:
+                checked_data.append(item.data())
+        return checked_data
+
 
 # ----------------------------------------------------------------------
 class MainWindow(QMainWindow):
@@ -360,8 +478,6 @@ class MainWindow(QMainWindow):
         self.select_osu_executable_button.clicked.connect(self.browse_osu_executable)
         self.controls_layout.addWidget(self.select_osu_executable_button)
 
-    
-
         self.main_layout.addLayout(self.controls_layout)
         # ------------------------------------------------------
         # Beatmap filters section
@@ -398,39 +514,39 @@ class MainWindow(QMainWindow):
 
         # ------------------------------------------------------
         # Date filter
-        self.layout_date_filter = QHBoxLayout()
-        self.layout_date_filter.setAlignment(QtCore.Qt.AlignmentFlag.AlignLeft)
+        self.date_filter_layout = QHBoxLayout()
+        self.date_filter_layout.setAlignment(QtCore.Qt.AlignmentFlag.AlignLeft)
 
-        self.date_filter_label = QLabel()
-        self.date_filter_label.setText("Date:")
-        self.date_filter_label.setFixedWidth(40)
-        self.layout_date_filter.addWidget(self.date_filter_label)
+        # Extra date filter
+        # + button to add extra date filter (put first, left-aligned)
+        self.date_filter_extra_button = QPushButton()
+        self.date_filter_extra_button.setText("+")
+        self.date_filter_extra_button.setFixedWidth(30)
+        self.date_filter_extra_button.setCheckable(True)
+        self.date_filter_layout.addWidget(self.date_filter_extra_button)
 
-        self.date_filter = QDateEdit()
-        self.date_filter.setDate(QtCore.QDate.currentDate())
-        self.date_filter.setDisplayFormat("dd-MM-yyyy")
-        self.date_filter.setCalendarPopup(True)
-        self.layout_date_filter.addWidget(self.date_filter)
+        # First date filter
+        self.date_filter_1 = DateFilterWidget()
+        self.date_filter_layout.addWidget(self.date_filter_1)
 
-        self.date_filter_since_button = QPushButton()
-        self.date_filter_since_button.setText("Since")
-        self.date_filter_since_button.setFixedWidth(60)
-        self.date_filter_since_button.clicked.connect(lambda: self.on_date_filter_button_click(1))
-        self.layout_date_filter.addWidget(self.date_filter_since_button)
+        # Second date filter
+        self.date_filter_2 = DateFilterWidget()
+        self.date_filter_2.setVisible(False)
+        self.date_filter_layout.addWidget(self.date_filter_2)
 
-        self.date_filter_until_button = QPushButton()
-        self.date_filter_until_button.setText("Until")
-        self.date_filter_until_button.setFixedWidth(60)
-        self.date_filter_until_button.clicked.connect(lambda: self.on_date_filter_button_click(2))
-        self.layout_date_filter.addWidget(self.date_filter_until_button)
+        # Toggle second date filter
+        self.date_filter_extra_button.clicked.connect(lambda:
+            self.date_filter_2.setVisible(not self.date_filter_2.isVisible())                                              
+        )
 
-        self.main_layout.addLayout(self.layout_date_filter)
+        self.main_layout.addLayout(self.date_filter_layout)
 
         # ------------------------------------------------------
-        # Beatmapset status
+        # Beatmapset status And mode
         self.layout_status_filter = QHBoxLayout()
         self.layout_status_filter.setAlignment(QtCore.Qt.AlignmentFlag.AlignLeft)
 
+        # STATUS
         self.status_filter_label = QLabel()
         self.status_filter_label.setText("Status:")
 
@@ -465,6 +581,23 @@ class MainWindow(QMainWindow):
         self.layout_status_filter.addWidget(self.status_filter_pending)
         self.layout_status_filter.addWidget(self.status_filter_unknown)
         self.layout_status_filter.addWidget(self.status_filter_approved)
+
+        # ---------------------------
+        # MODE
+
+        # Label
+        self.mode_filter_label = QLabel()
+        self.mode_filter_label.setText("Mode Select:")
+        self.layout_status_filter.addWidget(self.mode_filter_label)
+
+        self.mode_filter = QComboBox()
+        self.mode_filter.setFixedWidth(150)
+        self.mode_filter.addItem("Osu")
+        self.mode_filter.addItem("Catch The Beat")
+        self.mode_filter.addItem("Taiko")
+        self.mode_filter.addItem("Mania")
+
+        self.layout_status_filter.addWidget(self.mode_filter)
 
         self.main_layout.addLayout(self.layout_status_filter)
 
@@ -545,22 +678,6 @@ class MainWindow(QMainWindow):
         self.token_button.setText("Successful!")
         self.log_area.append("Token obtained")
 
-    def on_date_filter_button_click(self, button_type):
-        """
-        Handles the date filter buttons
-        
-        if one is clicked, the other is unclicked
-        1 = since
-        2 = until
-        """
-        
-        if button_type == 1:
-            self.date_filter_since_button.setEnabled(False)
-            self.date_filter_until_button.setEnabled(True)
-        elif button_type == 2:
-            self.date_filter_since_button.setEnabled(True)
-            self.date_filter_until_button.setEnabled(False)
-
     def on_download_maps_button_click(self):
         """Generates the full download URL based on the selected mirror and filters."""
 
@@ -578,6 +695,10 @@ class MainWindow(QMainWindow):
 
         # Extracted date filter logic
         if not self._add_date_filter():
+            return False
+        
+        # Extracted mods filter logic
+        if not self._add_mode_filter():
             return False
 
         # Build curl call for logging
@@ -739,23 +860,35 @@ class MainWindow(QMainWindow):
 
     def _add_date_filter(self):
         """Handles the date filter logic for the search parameters."""
-        date_value = self.date_filter.date()
-        if date_value.year() == 2000 and date_value.month() == 1 and date_value.day() == 1:
-            self.log_area.append("No date filter selected, doing 1 month old maps onwards")
-            date_value.setDate(QtCore.QDate.currentDate() - QtCore.QDate.months(1))
-            date_value = date_value.toString("yyyy-MM-dd")
-        else:
-            date_value = date_value.toString("yyyy-MM-dd")
+        def handle_single_date_filter(date_filter_widget):
+            if not date_filter_widget.isVisible():
+                return None
+            date_value = date_filter_widget.date_filter.date()
+            date_str = date_value.toString("yyyy-MM-dd")
+            if date_filter_widget.date_filter_since_button.isChecked():
+                # Since
+                return ('created>=' + date_str)
+            elif date_filter_widget.date_filter_until_button.isChecked():
+                # Until
+                return ('created<=' + date_str)
+            else:
+                # Default to since
+                return ('created>=' + date_str)
 
-        if not self.date_filter_since_button.isEnabled():
-            # Since
-            self.params.append('created>=' + date_value)
-        elif not self.date_filter_until_button.isEnabled():
-            # Until
-            self.params.append('created<' + date_value)
+        filter1 = handle_single_date_filter(self.date_filter_1)
+        filter2 = handle_single_date_filter(self.date_filter_2)
+
+        # If both filters exist, ensure since <= until
+        if filter1 and filter2:
+            if self.date_filter_1.date_filter.date() > self.date_filter_2.date_filter.date():
+                self.log_area.append("Invalid date range: 'Since' date is after 'Until' date.")
+                return False
+            self.params.append(filter1)
+            self.params.append(filter2)
         else:
-            self.log_area.append("No date filter selected. Using since by default.")
-            self.params.append('created>=' + date_value)
+            self.params.append(filter1)
+        # If neither is visible, do nothing
+
         return True
 
     def _add_status_filters(self):
@@ -779,6 +912,26 @@ class MainWindow(QMainWindow):
         if len(self.status_params) > 0:
             self.status_param += ",".join(self.status_params)
             self.params.append(self.status_param)
+
+    def _add_mode_filter(self):
+        """
+        Extracts modes to download beatmaps from
+        """
+
+        selected_item_index = self.mode_filter.currentIndex()
+        
+        if selected_item_index == 0:
+            self.params.append("mode=osu")
+        elif selected_item_index == 1:
+            self.params.append("mode=ctb")
+        elif selected_item_index == 2:
+            self.params.append("mode=taiko")
+        elif selected_item_index == 4:
+            self.params.append("mode=mania")
+        else:
+            self.log_area.append("Wrong Mode selected in _add_mode_filter")
+        
+        return True
 
 def main():
     '''
