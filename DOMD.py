@@ -5,7 +5,7 @@ Main controller for the Osu Map Downloader.
 By: Ricardo Faria
 Osu User: Doryoku
 
-Usage: run the script: run.sh
+Usage: run the script in cmd/terminal: python get_existing_ids_lazer.py
 """
 
 # ----------------------------------------------------------------------
@@ -22,10 +22,12 @@ import requests
 import json
 import PyQt6 as PQT6
 import PyQt6.QtCore as QtCore
-from PyQt6.QtWidgets import QApplication, QMainWindow, QPushButton, QVBoxLayout, QWidget, QTextEdit, QLineEdit, QHBoxLayout, QLabel, QComboBox, QDateEdit
-from PyQt6.QtCore import QThread, pyqtSignal
+from PyQt6.QtWidgets import QApplication, QMainWindow, QPushButton, QVBoxLayout, QWidget
+from PyQt6.QtWidgets import QLabel, QComboBox, QTextEdit, QLineEdit, QHBoxLayout, QDateEdit
+from PyQt6.QtWidgets import QFileDialog
+from PyQt6.QtCore import QThread, pyqtSignal, QEventLoop
 # ----------------------------------------------------------------------
-
+import config
 # ----------------------------------------------------------------------
 # VARIABLES
 # ----------------------------------------------------------------------
@@ -34,14 +36,15 @@ CLIENT_ID = '46676'
 CLIENT_SECRET = '7qRBCgwTQDEMTe0DiZ5Tb9QgpYt0lzEAIJ0fqXrC'
 REDIRECT_URL = 'http://localhost:8080'
 PORT = 8080
-BEATMAPSET_ID = 2201473
 # ----------------------------------------------------------------------
 # DIRS
 FILE_PATH = os.path.abspath(__file__)
 FULL_PATH = os.path.dirname(FILE_PATH)
 DOWNLOAD_PATH = os.path.join(os.path.dirname(FILE_PATH), "maps")
-OSU_LAZER_APPIMAGE = os.path.join(os.path.expanduser("~"), "Osu_Lazer.appimage")
+OSU_EXECUTABLE = None
+DB_JSON = os.path.join(FULL_PATH, "db.json")
 
+# Check for download path and make the directories
 if not os.path.exists(DOWNLOAD_PATH):
     os.makedirs(DOWNLOAD_PATH)
 
@@ -50,16 +53,15 @@ if not os.path.exists(DOWNLOAD_PATH):
 CHIMU="https://api.chimu.moe/v1/download/{set_id}?n=1"
 SAYO_BOT="https://dl.sayobot.cn/beatmaps/download/full/{set_id}"
 NERINYAN="https://api.nerinyan.moe/d/{set_id}"
-    
-
 
 
 # ----------------------------------------------------------------------
 class OsuLoginWorker(QThread):
     on_token_obtained_signal = pyqtSignal(str)
+    log_signal = pyqtSignal(str)
 
     def run(self):
-        print("Logging in Osu and obtaining token.")
+        self.log_signal.emit("Logging in Osu and obtaining token.")
 
         # Auth URL for app code
         auth_url = 'https://osu.ppy.sh/oauth/authorize?' + urlencode({
@@ -70,7 +72,7 @@ class OsuLoginWorker(QThread):
         })
 
         # Open the browser for authentication
-        print("Opening browser...")
+        self.log_signal.emit("Opening browser...")
         webbrowser.open(auth_url)
 
         # Opening a server to listen for responde. 127.0.0.1:8080
@@ -78,7 +80,7 @@ class OsuLoginWorker(QThread):
         server.bind(('localhost', PORT))
         server.listen(1)
 
-        print(f"Waiting callback for {REDIRECT_URL}...")
+        self.log_signal.emit(f"Waiting callback for {REDIRECT_URL}...")
         client, addr = server.accept() # Wait until server response
 
         # Read response and format/decode to utf
@@ -94,7 +96,6 @@ class OsuLoginWorker(QThread):
         try:
             url_line = request.splitlines()[0] # First line of the json response
             code = url_line.split('code=')[1].split(' ')[0] # Finding the code= keyword and splitting the coe
-            print(f"Code obtained: {code}")
         except IndexError:
             print("Error: Code not received.")
             return None
@@ -118,7 +119,7 @@ class OsuLoginWorker(QThread):
             # send the signal and the token
             self.on_token_obtained_signal.emit(access_token)
         else:
-            print(f"Error canjeando token: {response.text}")
+            self.log_signal.emit(f"Error trading for token: {response.text}")
             return None
 
 class DownloadWorker(QThread):
@@ -137,20 +138,178 @@ class DownloadWorker(QThread):
             try:
                 download_response = requests.get(download_url, allow_redirects=True)
                 if download_response.status_code == 200:
-                    # Save to ./downloads/prueba_mirror.osz
+                    # Save to ./maps/set_id.osz
                     filename = os.path.join(DOWNLOAD_PATH, f"{set_id}.osz")
                     with open(filename, 'wb') as f:
                         f.write(download_response.content)
 
-                    # Open in Osu Lazer
+                    # Open in Osu
                     self.downloaded_map_signal.emit(filename)
 
                     self.log_signal.emit(f"Downloaded and saved as: {set_id}")
                 else:
                     self.log_signal.emit(f"Failed to download from {download_url}: Status code {download_response.status_code}")
             except Exception as e:
-                self.log_signal.emit(f"Exception occurred while downloading from {download_url}: {e}")
+                print(f"Exception occurred while downloading from {download_url}: {e}")
+
+class BeatmatsetIdsWorker(QThread):
+    log_signal = pyqtSignal(str)
+    fetched_signal = pyqtSignal()
+    finished_signal = pyqtSignal(list)
+
+    def __init__(self, this_params):
+        super().__init__()
+        self.call_params = this_params
+        self.dest_list = [] 
+        self.current_page = 1
+
+    def run(self):
+        # Set to detect duplicates
+        session_ids = set()
+        cursor = None
+
+        self.log_signal.emit("Starting beatmapset ids worker...")
+
+        while True:
+            # Copy params so cursor doesnt repeat
+            current_params = self.call_params.copy()
+
+            # after the 2nd run, if cursor exists, it should copy the params
+            if cursor:
+                for key, value in cursor.items():
+                    current_params[f"cursor[{key}]"] = value
+            
+            # Call for beatmapset ids from OSU API
+            try:
+                self.response = requests.get(
+                    "https://osu.ppy.sh/api/v2/beatmapsets/search",
+                    headers={
+                        "Authorization": f"Bearer {ACCESS_TOKEN}",
+                        "Accept": "application/json"
+                    },
+                    params=current_params
+                )
+
+                # if good response
+                if self.response.status_code != 200:
+                    self.log_signal.emit(f"Error API: {self.response.status_code} - {self.response.text}")
+                    break
+                
+                # converting to JSON
+                data = self.response.json()
+                self.beatmapsets = data.get('beatmapsets', [])
+                
+
+                if not self.beatmapsets:
+                    self.log_signal.emit("Nothing was found.")
+                    break
+                
+                # Check for repeated list
+                first_id = int(self.beatmapsets[0]['id'])
+                
+                if first_id in session_ids:
+                    self.log_signal.emit(f"⚠️ STOPPED: Api returned the page {self.current_page} - repeated.")
+                    break
+                
+                # Process ids
+                new_beatmapset_ids_in_page = 0
+                for beatmapset in self.beatmapsets:
+                    b_id = int(beatmapset['id']) # Secure the id is taken as an int
+
+                    # History to avoid repeated or infinite loops
+                    session_ids.add(b_id)
+
+                    # Adding to the final list to return
+                    if b_id not in self.dest_list:
+                        self.dest_list.append(b_id)
+                        new_beatmapset_ids_in_page += 1
+
+                self.log_signal.emit(f"Page {self.current_page}: Received {len(self.beatmapsets)}. New Ids: {new_beatmapset_ids_in_page}. Total: {len(self.dest_list)}")
+
+                # Update cursor for next run
+                cursor = data.get('cursor')
+                self.current_page += 1
+                if not cursor:
+                    self.log_signal.emit("End of results (Cursor empty).")
+                    break
+                    
+            except Exception as e:
+                print(f"Critic exception in the thread: {e}")
+                break
         
+        # While ended, emit signal with list
+        self.log_signal.emit(f"Search finished, total beatmatset ids found: {len(self.dest_list)}")
+        self.finished_signal.emit(self.dest_list)
+
+class StarRatingFilterWidget(QWidget):
+    def __init__(self):
+        super().__init__()
+
+        # Layout
+        self.layout = QHBoxLayout()
+        self.layout.setAlignment(QtCore.Qt.AlignmentFlag.AlignLeft)
+
+        # Stars label
+        self.stars_label = QLabel()
+        self.stars_label.setText("Stars: ")
+        self.stars_label.setFixedWidth(40)
+        self.layout.addWidget(self.stars_label)
+
+        # Beatmap difficulty
+        self.difficulty_label = QLineEdit()
+        self.difficulty_label.setPlaceholderText("(e.g., 8)")
+        self.difficulty_label.setFixedWidth(50)
+        self.layout.addWidget(self.difficulty_label)
+        
+        # Boolean check buttons
+        self.higher_than_check_button = QPushButton()
+        self.higher_than_check_button.setText(">")
+        self.higher_than_check_button.setCheckable(True)
+        self.higher_than_check_button.setFixedWidth(30)
+        self.higher_than_check_button.clicked.connect(lambda: self.on_diff_button_click(1))
+        self.layout.addWidget(self.higher_than_check_button)
+
+        self.equals_check_button = QPushButton()
+        self.equals_check_button.setText("=")
+        self.equals_check_button.setCheckable(True)
+        self.equals_check_button.setFixedWidth(30)
+        self.equals_check_button.clicked.connect(lambda: self.on_diff_button_click(2))
+        self.layout.addWidget(self.equals_check_button)
+
+        self.less_than_check_button = QPushButton()
+        self.less_than_check_button.setText("<")
+        self.less_than_check_button.setCheckable(True)
+        self.less_than_check_button.setFixedWidth(30)
+        self.less_than_check_button.clicked.connect(lambda: self.on_diff_button_click(3))
+        self.layout.addWidget(self.less_than_check_button)
+
+        self.setLayout(self.layout)
+
+    def get_layout(self):
+        return self.layout
+    
+    def on_diff_button_click(self, button_type):
+        """
+        Handles the difficulty filter buttons
+        
+        if one is clicked, the others are unclicked
+        1 = higher than
+        2 = equals
+        3 = less than
+        """
+        
+        if button_type == 1:
+            self.higher_than_check_button.setEnabled(False)
+            self.equals_check_button.setEnabled(True)
+            self.less_than_check_button.setEnabled(True)
+        elif button_type == 2:
+            self.higher_than_check_button.setEnabled(True)
+            self.equals_check_button.setEnabled(False)
+            self.less_than_check_button.setEnabled(True)
+        elif button_type == 3:
+            self.higher_than_check_button.setEnabled(True)
+            self.equals_check_button.setEnabled(True)
+            self.less_than_check_button.setEnabled(False)
 
 # ----------------------------------------------------------------------
 class MainWindow(QMainWindow):
@@ -166,62 +325,76 @@ class MainWindow(QMainWindow):
         # Main layout
         self.main_layout = QVBoxLayout()
 
+        # ------------------------------------------------------
+        # Main controls section
+        # ------------------------------------------------------
+        # Layout
+        self.controls_layout = QHBoxLayout()
+
         # Token button
         self.token_button = QPushButton()
         self.token_button.setText("Get Token")
+        self.token_button.setFixedWidth(100)
         self.token_button.clicked.connect(self.startLogin)
-        self.main_layout.addWidget(self.token_button)
+        self.controls_layout.addWidget(self.token_button)
 
-        # Mirror dropdown
+        # Download Mirror dropdown
         self.mirror_label = QLabel()
         self.mirror_label.setText("Select Mirror:")
-        self.main_layout.addWidget(self.mirror_label)
+        self.mirror_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.controls_layout.addWidget(self.mirror_label)
 
         self.mirror_dropdown = QComboBox()
+        self.mirror_dropdown.setFixedWidth(150)
         self.mirror_dropdown.addItem("Chimu")
         self.mirror_dropdown.addItem("SayoBot")
         self.mirror_dropdown.addItem("Nerinyan")
-        self.main_layout.addWidget(self.mirror_dropdown)
+        self.controls_layout.addWidget(self.mirror_dropdown)
 
+        # Osu exe/app image selection
+        self.select_osu_executable = QLabel()
+        self.select_osu_executable.setText("Select Osu Executable:")
+        self.controls_layout.addWidget(self.select_osu_executable)
+
+        self.select_osu_executable_button = QPushButton("Browse")
+        self.select_osu_executable_button.clicked.connect(self.browse_osu_executable)
+        self.controls_layout.addWidget(self.select_osu_executable_button)
+
+    
+
+        self.main_layout.addLayout(self.controls_layout)
         # ------------------------------------------------------
         # Beatmap filters section
         # ------------------------------------------------------
-        self.layout_filters = QHBoxLayout()
-        self.layout_filters.setAlignment(QtCore.Qt.AlignmentFlag.AlignLeft)
 
         # ------------------------------------------------------
-        # Stars label
-        self.beatmap_difficulty_stars_label = QLabel()
-        self.beatmap_difficulty_stars_label.setText("Stars: ")
-        self.beatmap_difficulty_stars_label.setFixedWidth(40)
-        self.layout_filters.addWidget(self.beatmap_difficulty_stars_label)
+        # Star rating filter
+        self.star_rating_layout = QHBoxLayout()
+        self.star_rating_layout.setAlignment(QtCore.Qt.AlignmentFlag.AlignLeft)
 
-        # Beatmap difficulty
-        self.beatmap_difficulty_label = QLineEdit()
-        self.beatmap_difficulty_label.setPlaceholderText("(e.g., 8)")
-        self.beatmap_difficulty_label.setFixedWidth(50)
-        self.layout_filters.addWidget(self.beatmap_difficulty_label)
-        
-        # Boolean check buttons
-        self.beatmap_difficulty_higher_than_check_button = QPushButton()
-        self.beatmap_difficulty_higher_than_check_button.setText(">")
-        self.beatmap_difficulty_higher_than_check_button.setFixedWidth(30)
-        self.beatmap_difficulty_higher_than_check_button.clicked.connect(lambda: self.on_diff_button_click(1))
-        self.layout_filters.addWidget(self.beatmap_difficulty_higher_than_check_button)
+        # + button to add extra star rating filter (put first, left-aligned)
+        self.extra_star_rating_info = QPushButton()
+        self.extra_star_rating_info.setText("+")
+        self.extra_star_rating_info.setFixedWidth(30)
+        self.extra_star_rating_info.setCheckable(True)
+        self.star_rating_layout.addWidget(self.extra_star_rating_info)
 
-        self.beatmap_difficulty_equals_check_button = QPushButton()
-        self.beatmap_difficulty_equals_check_button.setText("=")
-        self.beatmap_difficulty_equals_check_button.setFixedWidth(30)
-        self.beatmap_difficulty_equals_check_button.clicked.connect(lambda: self.on_diff_button_click(2))
-        self.layout_filters.addWidget(self.beatmap_difficulty_equals_check_button)
+        # First star rating filter
+        self.star_rating_filter_1 = StarRatingFilterWidget()
+        self.star_rating_layout.addWidget(self.star_rating_filter_1)
 
-        self.beatmap_difficulty_less_than_check_button = QPushButton()
-        self.beatmap_difficulty_less_than_check_button.setText("<")
-        self.beatmap_difficulty_less_than_check_button.setFixedWidth(30)
-        self.beatmap_difficulty_less_than_check_button.clicked.connect(lambda: self.on_diff_button_click(3))
-        self.layout_filters.addWidget(self.beatmap_difficulty_less_than_check_button)
+        # Second star rating filter (hidden by default)
+        self.star_rating_filter_2 = StarRatingFilterWidget()
+        self.star_rating_filter_2.setVisible(False)
+        self.star_rating_layout.addWidget(self.star_rating_filter_2)
 
-        self.main_layout.addLayout(self.layout_filters)
+        # The lambda toggles the visibility of the second filter
+        self.extra_star_rating_info.clicked.connect(
+            lambda: self.star_rating_filter_2.setVisible(not self.star_rating_filter_2.isVisible())
+        )
+
+        # Add to main layout
+        self.main_layout.addLayout(self.star_rating_layout)
 
         # ------------------------------------------------------
         # Date filter
@@ -310,12 +483,58 @@ class MainWindow(QMainWindow):
         self.central_widget.setLayout(self.main_layout)
         self.setCentralWidget(self.central_widget)
 
+    def create_star_rating_filter(self):
+        # Stars label
+        self.beatmap_difficulty_stars_label = QLabel()
+        self.beatmap_difficulty_stars_label.setText("Stars: ")
+        self.beatmap_difficulty_stars_label.setFixedWidth(40)
+        self.layout_filters.addWidget(self.beatmap_difficulty_stars_label)
+
+        # Beatmap difficulty
+        self.beatmap_difficulty_label = QLineEdit()
+        self.beatmap_difficulty_label.setPlaceholderText("(e.g., 8)")
+        self.beatmap_difficulty_label.setFixedWidth(50)
+        self.layout_filters.addWidget(self.beatmap_difficulty_label)
+        
+        # Boolean check buttons
+        self.beatmap_difficulty_higher_than_check_button = QPushButton()
+        self.beatmap_difficulty_higher_than_check_button.setText(">")
+        self.beatmap_difficulty_higher_than_check_button.setFixedWidth(30)
+        self.beatmap_difficulty_higher_than_check_button.clicked.connect(lambda: self.on_diff_button_click(1))
+        self.layout_filters.addWidget(self.beatmap_difficulty_higher_than_check_button)
+
+        self.beatmap_difficulty_equals_check_button = QPushButton()
+        self.beatmap_difficulty_equals_check_button.setText("=")
+        self.beatmap_difficulty_equals_check_button.setFixedWidth(30)
+        self.beatmap_difficulty_equals_check_button.clicked.connect(lambda: self.on_diff_button_click(2))
+        self.layout_filters.addWidget(self.beatmap_difficulty_equals_check_button)
+
+        self.beatmap_difficulty_less_than_check_button = QPushButton()
+        self.beatmap_difficulty_less_than_check_button.setText("<")
+        self.beatmap_difficulty_less_than_check_button.setFixedWidth(30)
+        self.beatmap_difficulty_less_than_check_button.clicked.connect(lambda: self.on_diff_button_click(3))
+        self.layout_filters.addWidget(self.beatmap_difficulty_less_than_check_button)
+
+        self.main_layout.addLayout(self.layout_filters)
+
+    def browse_osu_executable(self):
+            global OSU_EXECUTABLE
+            file_dialog = QFileDialog(self)
+            file_dialog.setFileMode(QFileDialog.FileMode.ExistingFile)
+            file_dialog.setNameFilter("Executable Files (*.exe *.AppImage);;All Files (*)")
+            if file_dialog.exec():
+                selected_files = file_dialog.selectedFiles()
+                if selected_files:
+                    OSU_EXECUTABLE = selected_files[0]
+                    self.log_area.append(f"Selected Osu executable: {OSU_EXECUTABLE}")
+
     def startLogin(self):
         self.token_button.setEnabled(False)
         self.token_button.setText("Obtaining access token")
 
         self.login_worker = OsuLoginWorker()
         self.login_worker.on_token_obtained_signal.connect(self.onAccessTokenObtained)
+        self.login_worker.log_signal.connect(self.log_area.append)
 
         self.login_worker.start()
 
@@ -324,31 +543,7 @@ class MainWindow(QMainWindow):
         ACCESS_TOKEN = token
 
         self.token_button.setText("Successful!")
-
-        print(f"Token obtained {ACCESS_TOKEN}")
-   
-    def on_diff_button_click(self, button_type):
-        """
-        Handles the difficulty filter buttons
-        
-        if one is clicked, the others are unclicked
-        1 = higher than
-        2 = equals
-        3 = less than
-        """
-        
-        if button_type == 1:
-            self.beatmap_difficulty_higher_than_check_button.setEnabled(False)
-            self.beatmap_difficulty_equals_check_button.setEnabled(True)
-            self.beatmap_difficulty_less_than_check_button.setEnabled(True)
-        elif button_type == 2:
-            self.beatmap_difficulty_higher_than_check_button.setEnabled(True)
-            self.beatmap_difficulty_equals_check_button.setEnabled(False)
-            self.beatmap_difficulty_less_than_check_button.setEnabled(True)
-        elif button_type == 3:
-            self.beatmap_difficulty_higher_than_check_button.setEnabled(True)
-            self.beatmap_difficulty_equals_check_button.setEnabled(True)
-            self.beatmap_difficulty_less_than_check_button.setEnabled(False)
+        self.log_area.append("Token obtained")
 
     def on_date_filter_button_click(self, button_type):
         """
@@ -386,96 +581,160 @@ class MainWindow(QMainWindow):
             return False
 
         # Build curl call for logging
+        self.call_cursor = None
+        self.current_page = 1
+
         # Build the query string for the search
         query_string = " ".join(self.params)
-        self.response = requests.get(
-            "https://osu.ppy.sh/api/v2/beatmapsets/search",
-            headers={
-            "Authorization": f"Bearer {ACCESS_TOKEN}",
-            "Content-Type": "application/x-www-form-urlencoded"
-            },
-            params={
+
+        call_params = {
             "q": query_string
             }
-        )
-
-        self.log_area.append("Params used: " + query_string)
-
-        self.log_area.append(f"Response code: {self.response.status_code}")
-
-        if self.response.status_code != 200:
-            self.log_area.append(f"Error obtaining beatmapsets: {self.response.text}")
-            return False
         
-        self.beatmapsets = self.response.json()['beatmapsets']
-        self.log_area.append(f"Found {len(self.beatmapsets)} beatmapsets matching the criteria.")
+        # Initialize wait loop
+        loop = QEventLoop()
 
-        self.beatmapsets_ids = [str(beatmapset['id']) for beatmapset in self.beatmapsets]
-        self.log_area.append("Beatmapset IDs: " + ", ".join(self.beatmapsets_ids))
+        # Curl caller that will collect all the beatmapsets ids with the filters
+        self.beatmapset_ids_worker = BeatmatsetIdsWorker(call_params)
+        self.beatmapset_ids_worker.log_signal.connect(self.log_area.append)
+        self.beatmapset_ids_worker.finished_signal.connect(loop.quit)
+        self.beatmapset_ids_worker.start()
+
+        self.log_area.append("Looking for beatmaps, wait!")
+
+        loop.exec()
+
+        # Reasigning for reutilization
+        self.beatmapset_ids = self.beatmapset_ids_worker.dest_list
 
         # Build download URLs based on selected mirror
         selected_mirror = self.mirror_dropdown.currentIndex()
         self.log_area.append(f"Selected mirror index: {selected_mirror}")
         self.download_urls = {}
-
-        for set_id in self.beatmapsets_ids:
-            mirror_url = self._get_mirror_url(set_id)
-            if mirror_url:
-                self.download_urls[set_id] = mirror_url
-                self.log_area.append(f"Download URL for set ID {set_id}: {mirror_url}")
+        self._build_download_urls()
 
         self.log_area.append("Download URLs generated successfully.")
 
         # Download the beatmaps
         self.downloadWorker = DownloadWorker(self.download_urls)
         self.downloadWorker.log_signal.connect(self.log_area.append)
-        self.downloadWorker.downloaded_map_signal.connect(self._open_map_in_osu_lazer)
+        self.downloadWorker.downloaded_map_signal.connect(self._open_map_in_osu)
         self.downloadWorker.start()
-
-        return True
         
-    def _open_map_in_osu_lazer(self, map_path):
+    def _build_download_urls(self):
+        """Builds download URLs for each beatmapset ID based on the selected mirror."""
+        try:
+            for set_id in self.beatmapset_ids:
+                self.log_area.append(f"Building current set_id mirror url for {set_id}")
+                mirror_url = self._get_mirror_url(set_id)
+                if mirror_url and not self.isMapAlreadyDownloaded(set_id):
+                    self.download_urls[set_id] = mirror_url
+                    self.log_area.append(f"Download URL for set ID {set_id}: {mirror_url}")
+                else:
+                    self.log_area.append(f"Mirror url already exist or map is already downloaded {set_id}")
+        except Exception as ex:
+            print(f"Exception caugh on _build_download_urls {ex}")
+
+    def isMapAlreadyDownloaded(self, map_id):
+        """Checks if a map ID is already in the db.json file."""
+        if not os.path.exists(DB_JSON):
+            return False
+
+
+        with open(DB_JSON, "r") as f:
+            data = json.load(f)
+
+        # Ensure "downloaded_maps" key exists
+        if "downloaded_maps" not in data:
+            data["downloaded_maps"] = []
+            with open(DB_JSON, "w") as f:
+                json.dump(data, f, indent=4)
+
+            return False
+
+        return map_id in data["downloaded_maps"]
+
+    def _update_json_file(self, map_path):
+        """Updates the db.json file with the newly downloaded maps."""
+
+        self.current_set_id = os.path.splitext(os.path.basename(map_path))[0]
+
+        if not os.path.exists(DB_JSON):
+            with open(DB_JSON, "w") as f:
+                json.dump({"downloaded_maps": []}, f)
+
+        with open(DB_JSON, "r") as f:
+            data = json.load(f)
+
+        if "downloaded_maps" not in data:
+            data["downloaded_maps"] = []
+
+        # Add newly downloaded maps to the list
+        data["downloaded_maps"].append(int(self.current_set_id))
+
+        with open(DB_JSON, "w") as f:
+            json.dump(data, f, indent=4)
+
+        self.log_area.append("db.json updated with newly downloaded maps.")
+        
+    def _open_map_in_osu(self, map_path):
         """Opens the downloaded map in Osu Lazer using the AppImage."""
-        if os.path.exists(OSU_LAZER_APPIMAGE):
-            os.system(f'"{OSU_LAZER_APPIMAGE}" "{map_path}" &')
-            self.log_area.append(f"Opened map in Osu Lazer: {map_path}")
+        if os.path.exists(OSU_EXECUTABLE):
+            os.system(f'"{OSU_EXECUTABLE}" "{map_path}" &')
+            self.log_area.append(f"Opened map in Osu: {map_path}")
+
+            # Update the JSON file with the downloaded maps
+            self._update_json_file(map_path)
         else:
-            self.log_area.append("Error: Osu Lazer AppImage not found.")
+            self.log_area.append("Error: Osu executable not found.")
 
     def _get_mirror_url(self, set_id):
         """Returns the download URL for the selected mirror and beatmapset ID."""
-        selected_mirror = self.mirror_dropdown.currentIndex()
-        if selected_mirror == 0:
-            return CHIMU.format(set_id=set_id)
-        elif selected_mirror == 1:
-            return SAYO_BOT.format(set_id=set_id)
-        elif selected_mirror == 2:
-            return NERINYAN.format(set_id=set_id)
-        else:
-            self.log_area.append("Error: Invalid mirror selected.")
-            return None
-
+        try:
+            self.log_area.append("LOG - Getting mirror url")
+            selected_mirror = self.mirror_dropdown.currentIndex()
+            if selected_mirror == 0:
+                return CHIMU.format(set_id=set_id)
+            elif selected_mirror == 1:
+                return SAYO_BOT.format(set_id=set_id)
+            elif selected_mirror == 2:
+                return NERINYAN.format(set_id=set_id)
+            else:
+                self.log_area.append("Error: Invalid mirror selected.")
+                return None
+        except Exception as ex:
+            print(f"Exception caugh on _get_mirror_url {ex}")
+    
     def _add_difficulty_filter(self):
         """Handles the difficulty filter logic for the search parameters."""
-        difficulty_text = self.beatmap_difficulty_label.text()
-        if difficulty_text != "":
-            try:
-                difficulty_value = float(difficulty_text)
-                if not self.beatmap_difficulty_higher_than_check_button.isEnabled():
-                    # Higher than
-                    self.params.append('stars>=' + str(difficulty_value))
-                elif not self.beatmap_difficulty_equals_check_button.isEnabled():
-                    # Equals
-                    self.params.append('stars=' + str(difficulty_value))
-                elif not self.beatmap_difficulty_less_than_check_button.isEnabled():
-                    # Less than
-                    self.params.append('stars<=' + str(difficulty_value))
-                else:
-                    self.log_area.append("No difficulty filter selected. Using equals by default.")
-                    self.params.append('stars=' + str(difficulty_value))
-            except ValueError:
-                self.log_area.append("Error: Difficulty must be a number.")
-                return False
+
+        def handle_single_difficulty_filter(star_rating_obj):
+            difficulty_text = star_rating_obj.difficulty_label.text()
+
+            if difficulty_text != "":
+                try:
+                    difficulty_value = float(difficulty_text)
+                    if star_rating_obj.higher_than_check_button.isChecked():
+                        # Higher than
+                        self.params.append('stars>=' + str(difficulty_value))
+                    elif star_rating_obj.equals_check_button.isChecked():
+                        # Equals
+                        self.params.append('stars=' + str(difficulty_value))
+                    elif star_rating_obj.less_than_check_button.isChecked():
+                        # Less than
+                        self.params.append('stars<=' + str(difficulty_value))
+                    else:
+                        self.log_area.append("No difficulty filter selected. Using equals by default.")
+                        self.params.append('stars=' + str(difficulty_value))
+                except ValueError:
+                    self.log_area.append("Error: Difficulty must be a number.")
+                    return False
+            return True
+
+        if not handle_single_difficulty_filter(self.star_rating_filter_1):
+            return False
+        if not handle_single_difficulty_filter(self.star_rating_filter_2):
+            return False
         return True
 
     def _add_date_filter(self):
