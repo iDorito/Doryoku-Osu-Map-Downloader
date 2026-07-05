@@ -11,6 +11,7 @@ Usage: run the script in cmd/terminal: python get_existing_ids_lazer.py
 # ----------------------------------------------------------------------
 # Standard libraries
 from concurrent.futures import thread
+import concurrent.futures
 import socket
 import os
 import subprocess
@@ -63,9 +64,55 @@ SETTINGS_FILE_PATH.mkdir(parents=True, exist_ok=True)
 
 # ---------------------
 # --- BEATMAPSET MIRRORS ---
-CHIMU="https://api.chimu.moe/v1/download/{set_id}?n=1"
+MINO="https://catboy.best/d/{set_id}"
 SAYO_BOT="https://dl.sayobot.cn/beatmaps/download/full/{set_id}"
 NERINYAN="https://api.nerinyan.moe/d/{set_id}"
+OSU_DIRECT="https://api.osu.direct/d/{set_id}"
+HINAMIZAWA="https://mirror.hinamizawa.ai/d/{set_id}"
+
+# ----------------------------------------------------------------------
+class MirrorHealthWorker(QThread):
+    health_result_signal = pyqtSignal(dict)
+    log_signal = pyqtSignal(str)
+
+    def run(self):
+        # We will use set_id 320118 (No Title) as reference
+        reference_id = 320118
+        mirrors = {
+            "Catboy (Mino)": MINO.format(set_id=reference_id),
+            "SayoBot": SAYO_BOT.format(set_id=reference_id),
+            "Nerinyan": NERINYAN.format(set_id=reference_id),
+            "Osu.Direct": OSU_DIRECT.format(set_id=reference_id),
+            "Hinamizawa": HINAMIZAWA.format(set_id=reference_id)
+        }
+        
+        results = {}
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
+        }
+        
+        def check_mirror(name, url):
+            try:
+                # Use stream=True and close() to only fetch headers and a tiny bit of content, making it fast.
+                response = requests.get(url, headers=headers, stream=True, timeout=10, allow_redirects=True)
+                is_ok = (response.status_code == 200)
+                response.close()
+                return name, is_ok
+            except Exception:
+                return name, False
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+            futures = [executor.submit(check_mirror, name, url) for name, url in mirrors.items()]
+            for future in concurrent.futures.as_completed(futures):
+                name, is_ok = future.result()
+                results[name] = is_ok
+                if is_ok:
+                    self.log_signal.emit(f"Mirror {name} is UP")
+                else:
+                    self.log_signal.emit(f"Mirror {name} is DOWN")
+                
+        self.health_result_signal.emit(results)
 
 # ----------------------------------------------------------------------
 class OsuLoginWorker(QThread):
@@ -138,6 +185,11 @@ class OsuLoginWorker(QThread):
         
     def open_navigator(self, url):
         if sys.platform == 'linux':
+            # Check if running under WSL
+            if 'WSL_DISTRO_NAME' in os.environ:
+                subprocess.Popen(['powershell.exe', '-NoProfile', '-Command', f'Start-Process "{url}"'])
+                return
+
             # 1. Hacemos una copia del entorno actual
             env = os.environ.copy()
             
@@ -163,25 +215,39 @@ class DownloadWorker(QThread):
         self.download_urls = download_urls
 
     def run(self):
-        for set_id, download_url in self.download_urls.items():
-            self.log_signal.emit(f"Downloading from: {download_url}")
+        def download_map(set_id, urls):
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
+            }
+            for url in urls:
+                self.log_signal.emit(f"Downloading map {set_id} from: {url}")
+                try:
+                    download_response = requests.get(url, headers=headers, allow_redirects=True, timeout=15)
+                    if download_response.status_code == 200:
+                        filename = os.path.join(DOWNLOAD_PATH, f"{set_id}.osz")
+                        with open(filename, 'wb') as f:
+                            f.write(download_response.content)
+                        self.downloaded_map_signal.emit(filename)
+                        self.log_signal.emit(f"Downloaded and saved as: {set_id}")
+                        return True
+                    else:
+                        self.log_signal.emit(f"Failed to download map {set_id} from {url}: Status code {download_response.status_code}")
+                except Exception as e:
+                    self.log_signal.emit(f"Exception occurred downloading map {set_id} from {url}: {e}")
+            self.log_signal.emit(f"Failed to download map {set_id} from all available mirrors.")
+            return False
+
+        # Limit concurrent downloads to 4 as requested, mirrors should be verified beforehand
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+            futures = []
+            for set_id, download_urls_list in self.download_urls.items():
+                futures.append(executor.submit(download_map, set_id, download_urls_list))
             
-            try:
-                download_response = requests.get(download_url, allow_redirects=True)
-                if download_response.status_code == 200:
-                    # Save to ./maps/set_id.osz
-                    filename = os.path.join(DOWNLOAD_PATH, f"{set_id}.osz")
-                    with open(filename, 'wb') as f:
-                        f.write(download_response.content)
+            concurrent.futures.wait(futures)
 
-                    # Open in Osu
-                    self.downloaded_map_signal.emit(filename)
-
-                    self.log_signal.emit(f"Downloaded and saved as: {set_id}")
-                else:
-                    self.log_signal.emit(f"Failed to download from {download_url}: Status code {download_response.status_code}")
-            except Exception as e:
-                print(f"Exception occurred while downloading from {download_url}: {e}")
+        self.log_signal.emit("All map downloads finished.")
+        self.downloads_finished_signal.emit()
 
 class BeatmatsetIdsWorker(QThread):
     log_signal = pyqtSignal(str)
@@ -339,26 +405,23 @@ class StarRatingFilterWidget(QWidget):
     
     def on_diff_button_click(self, button_type):
         """
-        Handles the difficulty filter buttons
-        
-        if one is clicked, the others are unclicked
+        Handles the difficulty filter buttons like radio buttons
         1 = higher than
         2 = equals
         3 = less than
         """
-        
         if button_type == 1:
-            self.higher_than_check_button.setEnabled(False)
-            self.equals_check_button.setEnabled(True)
-            self.less_than_check_button.setEnabled(True)
+            self.higher_than_check_button.setChecked(True)
+            self.equals_check_button.setChecked(False)
+            self.less_than_check_button.setChecked(False)
         elif button_type == 2:
-            self.higher_than_check_button.setEnabled(True)
-            self.equals_check_button.setEnabled(False)
-            self.less_than_check_button.setEnabled(True)
+            self.higher_than_check_button.setChecked(False)
+            self.equals_check_button.setChecked(True)
+            self.less_than_check_button.setChecked(False)
         elif button_type == 3:
-            self.higher_than_check_button.setEnabled(True)
-            self.equals_check_button.setEnabled(True)
-            self.less_than_check_button.setEnabled(False)
+            self.higher_than_check_button.setChecked(False)
+            self.equals_check_button.setChecked(False)
+            self.less_than_check_button.setChecked(True)
 
 class DateFilterWidget(QWidget):
     def __init__(self):
@@ -396,25 +459,16 @@ class DateFilterWidget(QWidget):
 
     def on_date_filter_button_click(self, button_type):
         """
-        Handles the date filter buttons
-        
-        if one is clicked, the other is unclicked
+        Handles the date filter buttons like radio buttons
         1 = since
         2 = until
         """
-        
         if button_type == 1:
-            self.date_filter_since_button.setEnabled(False)
-            self.date_filter_until_button.setEnabled(True)
-
-            # Re enable check for <= button
+            self.date_filter_since_button.setChecked(True)
             self.date_filter_until_button.setChecked(False)
         elif button_type == 2:
-            self.date_filter_since_button.setEnabled(True)
-            self.date_filter_until_button.setEnabled(False)
-
-            # Re enable check for >= button
             self.date_filter_since_button.setChecked(False)
+            self.date_filter_until_button.setChecked(True)
 
 class CheckableComboBox(QComboBox):
     def __init__(self):
@@ -511,9 +565,11 @@ class MainWindow(QMainWindow):
 
         self.mirror_dropdown = QComboBox()
         self.mirror_dropdown.setFixedWidth(150)
-        self.mirror_dropdown.addItem("Chimu")
+        self.mirror_dropdown.addItem("Catboy (Mino)")
         self.mirror_dropdown.addItem("SayoBot")
         self.mirror_dropdown.addItem("Nerinyan")
+        self.mirror_dropdown.addItem("Osu.Direct")
+        self.mirror_dropdown.addItem("Hinamizawa")
         self.controls_layout.addWidget(self.mirror_dropdown)
 
         # Osu exe/app image selection
@@ -526,6 +582,24 @@ class MainWindow(QMainWindow):
         self.controls_layout.addWidget(self.select_osu_executable_button)
 
         self.main_layout.addLayout(self.controls_layout)
+
+        # Mirror Health Section
+        self.health_layout = QHBoxLayout()
+        
+        self.check_health_button = QPushButton("Check Mirrors Health")
+        self.check_health_button.setFixedWidth(150)
+        self.check_health_button.clicked.connect(self.check_mirrors_health)
+        self.health_layout.addWidget(self.check_health_button)
+        
+        self.health_labels = {}
+        for mirror_name in ["Catboy (Mino)", "SayoBot", "Nerinyan", "Osu.Direct", "Hinamizawa"]:
+            lbl = QLabel(f"{mirror_name}: ⚪")
+            lbl.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            self.health_labels[mirror_name] = lbl
+            self.health_layout.addWidget(lbl)
+            
+        self.main_layout.addLayout(self.health_layout)
+        
         # ------------------------------------------------------
         # Beatmap filters section
         # ------------------------------------------------------
@@ -742,9 +816,35 @@ class MainWindow(QMainWindow):
 
 
 
+    def check_mirrors_health(self):
+        self.check_health_button.setEnabled(False)
+        self.log_area.append("Checking health of all mirrors, please wait...")
+        for lbl in self.health_labels.values():
+            lbl.setText(lbl.text().split(":")[0] + ": ⏳")
+            
+        self.mirror_health_worker = MirrorHealthWorker()
+        self.mirror_health_worker.log_signal.connect(self.log_area.append)
+        self.mirror_health_worker.health_result_signal.connect(self.on_mirrors_health_checked)
+        self.mirror_health_worker.start()
+
+    def on_mirrors_health_checked(self, results):
+        for name, is_ok in results.items():
+            if name in self.health_labels:
+                status = "🟢" if is_ok else "🔴"
+                self.health_labels[name].setText(f"{name}: {status}")
+        self.log_area.append("Mirror health check completed.")
+        self.check_health_button.setEnabled(True)
+
     def browse_osu_executable(self):
             global OSU_EXECUTABLE
             file_dialog = QFileDialog(self)
+            if config.IS_WSL:
+                try:
+                    localappdata_win = subprocess.check_output(['powershell.exe', '-NoProfile', '-Command', '[Console]::Out.Write($env:LOCALAPPDATA)']).decode().strip()
+                    start_dir = subprocess.check_output(['wslpath', '-u', localappdata_win]).decode().strip()
+                    file_dialog.setDirectory(start_dir)
+                except:
+                    file_dialog.setDirectory("/mnt/c/")
             file_dialog.setFileMode(QFileDialog.FileMode.ExistingFile)
             file_dialog.setNameFilter("Executable Files (*.exe *.AppImage);;All Files (*)")
             if file_dialog.exec():
@@ -778,73 +878,54 @@ class MainWindow(QMainWindow):
             return False
         
         self.log_area.append("Building curl call to search for beatmapsets ids...")
-
         self.params = []
 
-        # Extracted difficulty filter logic
-        if not self._add_difficulty_filter():
-            return False
+        # Build parameters
+        if not self._add_difficulty_filter(): return False
+        if not self._add_date_filter(): return False
+        if not self._add_status_filters(): return False
+        if not self._add_mode_filter(): return False
 
-        # Extracted date filter logic
-        if not self._add_date_filter():
-            return False
-        
-        # Extracted mods filter logic
-        if not self._add_mode_filter():
-            return False
-
-        # Build curl call for logging
-        self.call_cursor = None
-        self.current_page = 1
-
-        # Build the query string for the search
         query_string = " ".join(self.params)
-
-        call_params = {
-            "q": query_string
-            }
+        call_params = {"q": query_string}
         
-        # Initialize wait loop
-        loop = QEventLoop()
-
-        # Curl caller that will collect all the beatmapsets ids with the filters
+        # Disable button while fetching and downloading
+        self.download_button.setEnabled(False)
+        self.log_area.append("Looking for beatmaps, wait!")
+        
         self.beatmapset_ids_worker = BeatmatsetIdsWorker(call_params)
         self.beatmapset_ids_worker.log_signal.connect(self.log_area.append)
-        self.beatmapset_ids_worker.finished_signal.connect(loop.quit)
+        self.beatmapset_ids_worker.finished_signal.connect(self.on_beatmapset_ids_fetched)
         self.beatmapset_ids_worker.start()
 
-        self.log_area.append("Looking for beatmaps, wait!")
-
-        loop.exec()
-
-        # Reasigning for reutilization
-        self.beatmapset_ids = self.beatmapset_ids_worker.dest_list
-
-        # Build download URLs based on selected mirror
+    def on_beatmapset_ids_fetched(self, dest_list):
+        self.beatmapset_ids = dest_list
+        self.download_urls = {}
+        
         selected_mirror = self.mirror_dropdown.currentIndex()
         self.log_area.append(f"Selected mirror index: {selected_mirror}")
-        self.download_urls = {}
+        
         self._build_download_urls()
-
         self.log_area.append("Download URLs generated successfully.")
 
-        # Download the beatmaps
         self.downloadWorker = DownloadWorker(self.download_urls)
         self.downloadWorker.log_signal.connect(self.log_area.append)
         self.downloadWorker.downloaded_map_signal.connect(self._open_map_in_osu)
+        
+        # Re-enable button when all downloads finish
+        self.downloadWorker.downloads_finished_signal.connect(lambda: self.download_button.setEnabled(True))
         self.downloadWorker.start()
         
     def _build_download_urls(self):
         """Builds download URLs for each beatmapset ID based on the selected mirror."""
         try:
             for set_id in self.beatmapset_ids:
-                self.log_area.append(f"Building current set_id mirror url for {set_id}")
-                mirror_url = self._get_mirror_url(set_id)
-                if mirror_url and not self.isMapAlreadyDownloaded(set_id):
-                    self.download_urls[set_id] = mirror_url
-                    self.log_area.append(f"Download URL for set ID {set_id}: {mirror_url}")
+                if not self.isMapAlreadyDownloaded(set_id):
+                    self.log_area.append(f"Building mirror urls for {set_id}")
+                    urls = self._get_mirror_urls(set_id)
+                    self.download_urls[set_id] = urls
                 else:
-                    self.log_area.append(f"Mirror url already exist or map is already downloaded {set_id}")
+                    self.log_area.append(f"Map is already downloaded {set_id}")
         except Exception as ex:
             print(f"Exception caugh on _build_download_urls {ex}")
 
@@ -891,7 +972,7 @@ class MainWindow(QMainWindow):
         self.log_area.append("db.json updated with newly downloaded maps.")
         
     def _open_map_in_osu(self, map_path):
-        """Opens the downloaded map in Osu Lazer using the AppImage."""
+        """Opens the downloaded map in Osu Lazer using the AppImage or Exe."""
         # If on Windows, let the OS open the file with its associated app
         if sys.platform.startswith("win") or os.name == "nt":
             try:
@@ -911,31 +992,40 @@ class MainWindow(QMainWindow):
                 self.log_area.append(f"Error opening map with default app: {e}")
                 return
         elif sys.platform == "linux":
-            if os.path.exists(OSU_EXECUTABLE):
-                os.system(f'"{OSU_EXECUTABLE}" "{map_path}" &')
-                self.log_area.append(f"Opened map in Osu: {map_path}")
-
-                # Update the JSON file with the downloaded maps
-                self._update_json_file(map_path)
+            if OSU_EXECUTABLE and os.path.exists(OSU_EXECUTABLE):
+                if config.IS_WSL:
+                    try:
+                        win_map_path = subprocess.check_output(['wslpath', '-w', map_path]).decode().strip()
+                        subprocess.Popen([OSU_EXECUTABLE, win_map_path])
+                        self.log_area.append(f"Opened map in Osu (WSL->Windows): {map_path}")
+                        self._update_json_file(map_path)
+                    except Exception as e:
+                        self.log_area.append(f"Error opening map via WSL: {e}")
+                else:
+                    os.system(f'"{OSU_EXECUTABLE}" "{map_path}" &')
+                    self.log_area.append(f"Opened map in Osu: {map_path}")
+                    self._update_json_file(map_path)
             else:
                 self.log_area.append("Error: Osu executable not found.")
 
-    def _get_mirror_url(self, set_id):
-        """Returns the download URL for the selected mirror and beatmapset ID."""
+    def _get_mirror_urls(self, set_id):
+        """Returns the download URLs for the selected mirror first, then the others as fallbacks."""
         try:
-            self.log_area.append("LOG - Getting mirror url")
+            urls = [
+                MINO.format(set_id=set_id),
+                SAYO_BOT.format(set_id=set_id),
+                NERINYAN.format(set_id=set_id),
+                OSU_DIRECT.format(set_id=set_id),
+                HINAMIZAWA.format(set_id=set_id)
+            ]
             selected_mirror = self.mirror_dropdown.currentIndex()
-            if selected_mirror == 0:
-                return CHIMU.format(set_id=set_id)
-            elif selected_mirror == 1:
-                return SAYO_BOT.format(set_id=set_id)
-            elif selected_mirror == 2:
-                return NERINYAN.format(set_id=set_id)
-            else:
-                self.log_area.append("Error: Invalid mirror selected.")
-                return None
+            if 0 <= selected_mirror < len(urls):
+                preferred = urls.pop(selected_mirror)
+                urls.insert(0, preferred)
+            return urls
         except Exception as ex:
-            print(f"Exception caugh on _get_mirror_url {ex}")
+            print(f"Exception caugh on _get_mirror_urls {ex}")
+            return []
     
     def _add_difficulty_filter(self):
         """Handles the difficulty filter logic for the search parameters."""
@@ -971,34 +1061,32 @@ class MainWindow(QMainWindow):
 
     def _add_date_filter(self):
         """Handles the date filter logic for the search parameters."""
-        def handle_single_date_filter(date_filter_widget):
+        def handle_single_date_filter(date_filter_widget, is_second=False):
             if not date_filter_widget.isVisible():
                 return None
             date_value = date_filter_widget.date_filter.date()
             date_str = date_value.toString("yyyy-MM-dd")
             if date_filter_widget.date_filter_since_button.isChecked():
-                # Since
                 return ('created>=' + date_str)
             elif date_filter_widget.date_filter_until_button.isChecked():
-                # Until
                 return ('created<=' + date_str)
             else:
-                # Default to since
-                return ('created>=' + date_str)
+                # Fallback in case none is checked:
+                return ('created<=' + date_str) if is_second else ('created>=' + date_str)
 
-        filter1 = handle_single_date_filter(self.date_filter_1)
-        filter2 = handle_single_date_filter(self.date_filter_2)
+        filter1 = handle_single_date_filter(self.date_filter_1, False)
+        filter2 = handle_single_date_filter(self.date_filter_2, True)
 
-        # If both filters exist, ensure since <= until
         if filter1 and filter2:
             if self.date_filter_1.date_filter.date() > self.date_filter_2.date_filter.date():
                 self.log_area.append("Invalid date range: 'Since' date is after 'Until' date.")
                 return False
             self.params.append(filter1)
             self.params.append(filter2)
-        else:
+        elif filter1:
             self.params.append(filter1)
-        # If neither is visible, do nothing
+        elif filter2:
+            self.params.append(filter2)
 
         return True
 
@@ -1023,6 +1111,8 @@ class MainWindow(QMainWindow):
         if len(self.status_params) > 0:
             self.status_param += ",".join(self.status_params)
             self.params.append(self.status_param)
+            
+        return True
 
     def _add_mode_filter(self):
         """
